@@ -1141,6 +1141,8 @@
                 samplerGain: 1.0,
                 samplerPan: 0.0,
                 mixerGain: 0.75,
+                lineInClipDataUrl: null,
+                lineInClipName: '',
                 arp: createDefaultArp()
             };
         }
@@ -1175,6 +1177,8 @@
                 samplerReverse: !!track.samplerReverse,
                 samplerGain: numberOrDefault(track.samplerGain, 1.0),
                 samplerPan: numberOrDefault(track.samplerPan, 0.0),
+                lineInClipDataUrl: track.typeId === 'lineIn' ? (track.lineInClipDataUrl || null) : null,
+                lineInClipName: track.typeId === 'lineIn' ? (track.lineInClipName || '') : '',
                 glide: !!track.glide,
                 glideTime: numberOrDefault(track.glideTime, 0.1),
                 glideMode: track.glideMode || 'portamento',
@@ -1230,6 +1234,8 @@
             track.samplerReverse = boolOrDefault(trackData.samplerReverse, defaults.samplerReverse);
             track.samplerGain = numberOrDefault(trackData.samplerGain, defaults.samplerGain);
             track.samplerPan = numberOrDefault(trackData.samplerPan, defaults.samplerPan);
+            track.lineInClipDataUrl = typeof trackData.lineInClipDataUrl === 'string' ? trackData.lineInClipDataUrl : null;
+            track.lineInClipName = typeof trackData.lineInClipName === 'string' ? trackData.lineInClipName : '';
             track.glide = boolOrDefault(trackData.glide, defaults.glide);
             track.glideTime = numberOrDefault(trackData.glideTime, defaults.glideTime);
             track.glideMode = trackData.glideMode || defaults.glideMode;
@@ -1245,7 +1251,295 @@
             if (includeMinimized) track.minimized = boolOrDefault(trackData.minimized, defaults.minimized);
             track.gainNode.gain.value = track.muted ? 0 : track.volume;
             applyTrackFilter(track);
+            if (track.typeId === 'lineIn' && track.lineInClipDataUrl) restoreLineInClip(track);
             return track;
+        }
+
+        // --- LINE IN: Windows input capture and audio clip playback ---
+        function stopLineInStream(track) {
+            if (!track) return;
+            if (track.lineInSourceNode) {
+                try { track.lineInSourceNode.disconnect(); } catch (e) { }
+                track.lineInSourceNode = null;
+            }
+            if (track.lineInInputStream) {
+                track.lineInInputStream.getTracks().forEach(mediaTrack => mediaTrack.stop());
+                track.lineInInputStream = null;
+            }
+            track.lineInLevel = -60;
+        }
+
+        function getLineInErrorMessage(error) {
+            if (!window.isSecureContext && location.protocol !== 'file:') return 'Microphone access requires HTTPS or localhost';
+            if (error?.name === 'NotAllowedError') return 'Input permission was denied in the browser';
+            if (error?.name === 'NotFoundError') return 'No audio input device was found';
+            if (error?.name === 'NotReadableError') return 'That input is busy or unavailable in Windows';
+            if (error?.name === 'OverconstrainedError') return 'The selected Windows input is no longer available';
+            return error?.message || 'Could not open the audio input';
+        }
+
+        function setLineInStatus(track, message) {
+            track.lineInStatus = message;
+            const status = document.getElementById(`line_in_status_${track.id}`);
+            if (status) status.textContent = message;
+        }
+
+        async function openLineInStream(track) {
+            if (!navigator.mediaDevices?.getUserMedia) throw new Error('Live input is not supported in this browser');
+            stopLineInStream(track);
+            const audio = track.lineInDeviceId && track.lineInDeviceId !== 'default'
+                ? { deviceId: { exact: track.lineInDeviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+                : { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+            const stream = await navigator.mediaDevices.getUserMedia({ audio });
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+            track.lineInInputStream = stream;
+            track.lineInSourceNode = audioCtx.createMediaStreamSource(stream);
+            track.lineInSourceNode.connect(track.lineInAnalyserNode);
+            track.lineInMonitorNode.gain.setTargetAtTime(track.lineInMonitorEnabled ? 1 : 0, audioCtx.currentTime, 0.01);
+            return stream;
+        }
+
+        async function refreshLineInDevices(track, select) {
+            if (!navigator.mediaDevices?.enumerateDevices || !select) return;
+            try {
+                const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput');
+                if (!select.isConnected) return;
+                select.textContent = '';
+                const defaultOption = document.createElement('option');
+                defaultOption.value = 'default';
+                defaultOption.textContent = 'Windows default input';
+                select.appendChild(defaultOption);
+                devices.forEach((device, index) => {
+                    if (device.deviceId === 'default') return;
+                    const option = document.createElement('option');
+                    option.value = device.deviceId;
+                    option.textContent = device.label || `Audio input ${index + 1}`;
+                    select.appendChild(option);
+                });
+                select.value = Array.from(select.options).some(option => option.value === track.lineInDeviceId)
+                    ? track.lineInDeviceId : 'default';
+            } catch (error) {
+                console.warn('Could not enumerate audio inputs:', error);
+            }
+        }
+
+        function blobToDataUrl(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error || new Error('Could not read the audio clip'));
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        async function decodeLineInDataUrl(dataUrl) {
+            const response = await fetch(dataUrl);
+            if (!response.ok) throw new Error(`Audio data returned ${response.status}`);
+            return audioCtx.decodeAudioData(await response.arrayBuffer());
+        }
+
+        async function restoreLineInClip(track) {
+            const dataUrl = track.lineInClipDataUrl;
+            if (!dataUrl) return;
+            try {
+                track.lineInBuffer = await decodeLineInDataUrl(dataUrl);
+                if (track.lineInClipDataUrl !== dataUrl) return;
+                track.lineInStatus = `${track.lineInClipName || 'Saved audio'} · ${track.lineInBuffer.duration.toFixed(1)}s`;
+                trackElementCache?.delete(track.id);
+                if (state.tracks.includes(track)) renderTracks();
+            } catch (error) {
+                setLineInStatus(track, `Saved clip could not be decoded: ${error.message}`);
+            }
+        }
+
+        async function loadLineInBlob(track, blob, name) {
+            if (!blob?.size) throw new Error('The audio clip is empty');
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+            const [dataUrl, decoded] = await Promise.all([
+                blobToDataUrl(blob),
+                audioCtx.decodeAudioData(await blob.arrayBuffer())
+            ]);
+            track.lineInClipDataUrl = dataUrl;
+            track.lineInClipName = name || 'Audio clip';
+            track.lineInBuffer = decoded;
+            track.grid[0][0] = { on: true, length: 1 };
+            track.lineInStatus = `${track.lineInClipName} · ${decoded.duration.toFixed(1)}s`;
+            markTrackGridDirty(track);
+            trackElementCache.delete(track.id);
+            renderTracks();
+        }
+
+        async function importLineInFile(track, file) {
+            if (!file) return;
+            try {
+                pushUndo();
+                await loadLineInBlob(track, file, file.name);
+            } catch (error) {
+                setLineInStatus(track, `Unsupported or damaged audio file: ${error.message}`);
+            }
+        }
+
+        async function toggleLineInRecording(track) {
+            if (track.lineInRecording && track.lineInRecorder) {
+                track.lineInRecorder.stop();
+                return;
+            }
+            try {
+                if (typeof MediaRecorder === 'undefined') throw new Error('Audio recording is not supported in this browser');
+                pushUndo();
+                const stream = track.lineInInputStream || await openLineInStream(track);
+                const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+                const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type));
+                track.lineInChunks = [];
+                track.lineInRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+                track.lineInRecorder.ondataavailable = event => {
+                    if (event.data?.size) track.lineInChunks.push(event.data);
+                };
+                track.lineInRecorder.onerror = event => setLineInStatus(track, getLineInErrorMessage(event.error));
+                track.lineInRecorder.onstop = async () => {
+                    track.lineInRecording = false;
+                    try {
+                        const blob = new Blob(track.lineInChunks, { type: track.lineInRecorder.mimeType || 'audio/webm' });
+                        const name = `Recording ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+                        await loadLineInBlob(track, blob, name);
+                    } catch (error) {
+                        setLineInStatus(track, `Recording could not be decoded: ${error.message}`);
+                    } finally {
+                        if (!track.lineInMonitorEnabled) stopLineInStream(track);
+                        trackElementCache.delete(track.id);
+                        renderTracks();
+                    }
+                };
+                track.lineInRecorder.start(250);
+                track.lineInRecording = true;
+                track.lineInStatus = 'Recording live input… press STOP when finished';
+                trackElementCache.delete(track.id);
+                renderTracks();
+            } catch (error) {
+                setLineInStatus(track, getLineInErrorMessage(error));
+            }
+        }
+
+        function clearLineInClip(track) {
+            pushUndo();
+            if (track.lineInActiveSource) {
+                try { track.lineInActiveSource.stop(); } catch (e) { }
+                track.lineInActiveSource = null;
+            }
+            track.lineInClipDataUrl = null;
+            track.lineInClipName = '';
+            track.lineInBuffer = null;
+            track.grid[0].fill(false);
+            track.lineInStatus = 'Choose an input, record, or import audio';
+            markTrackGridDirty(track);
+            trackElementCache.delete(track.id);
+            renderTracks();
+        }
+
+        function drawLineInWaveform(canvas, track) {
+            if (!canvas?.isConnected) return;
+            const dpr = window.devicePixelRatio || 1;
+            const width = Math.max(1, canvas.clientWidth);
+            const height = Math.max(1, canvas.clientHeight);
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            const ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+            const bg = ctx.createLinearGradient(0, 0, 0, height);
+            bg.addColorStop(0, '#07070b');
+            bg.addColorStop(0.52, '#05070a');
+            bg.addColorStop(1, '#040406');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 16; i++) {
+                const x = i * width / 16;
+                ctx.strokeStyle = i % 4 === 0 ? 'rgba(255, 234, 0, 0.1)' : 'rgba(255, 255, 255, 0.045)';
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+            }
+            for (let i = 0; i <= 8; i++) {
+                const y = i * height / 8;
+                ctx.strokeStyle = i === 4 ? 'rgba(255, 255, 255, 0.14)' : 'rgba(255, 255, 255, 0.045)';
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+            }
+
+            if (!track.lineInBuffer) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.34)';
+                ctx.font = '10px monospace';
+                ctx.fillText('RECORD OR IMPORT AUDIO', 10, 19);
+            } else {
+                const data = track.lineInBuffer.getChannelData(0);
+                const stride = Math.max(1, Math.floor(data.length / width));
+                const peaks = [];
+                for (let x = 0; x < width; x++) {
+                    let min = 1, max = -1;
+                    const start = x * stride;
+                    for (let i = 0; i < stride && start + i < data.length; i++) {
+                        const value = data[start + i];
+                        min = Math.min(min, value); max = Math.max(max, value);
+                    }
+                    peaks.push({ min, max });
+                }
+                ctx.fillStyle = 'rgba(255, 234, 0, 0.2)';
+                for (let x = 0; x < peaks.length; x++) {
+                    const { min, max } = peaks[x];
+                    if (min <= max) ctx.fillRect(x, (1 + min) * height / 2, 1, (max - min) * height / 2);
+                }
+                ctx.shadowBlur = 3;
+                ctx.shadowColor = 'rgba(255, 234, 0, 0.45)';
+                ctx.strokeStyle = '#ffea00';
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                for (let x = 0; x < peaks.length; x++) {
+                    const { min, max } = peaks[x];
+                    ctx.moveTo(x, (1 + min) * height / 2);
+                    ctx.lineTo(x, (1 + max) * height / 2);
+                }
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                if (track.lineInActiveSource && track.lineInPlaybackStartedAt) {
+                    const elapsed = audioCtx.currentTime - track.lineInPlaybackStartedAt;
+                    const progress = elapsed / Math.max(0.001, track.lineInPlaybackDuration || track.lineInBuffer.duration);
+                    if (progress >= 0 && progress < 1) {
+                        ctx.shadowBlur = 5;
+                        ctx.shadowColor = '#ff2fd6';
+                        ctx.strokeStyle = '#ff2fd6';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(progress * width, 0);
+                        ctx.lineTo(progress * width, height);
+                        ctx.stroke();
+                        ctx.shadowBlur = 0;
+                    }
+                }
+            }
+        }
+
+        function updateLineInMeter(meter, track, waveform = null) {
+            if (!meter?.isConnected) return;
+            const fill = meter.querySelector('.line-in-level-fill');
+            const readout = meter.querySelector('.line-in-level-readout');
+            let db = -60;
+            if (track.lineInInputStream?.active && track.lineInAnalyserNode) {
+                const samples = track.lineInMeterSamples || new Float32Array(track.lineInAnalyserNode.fftSize);
+                track.lineInMeterSamples = samples;
+                track.lineInAnalyserNode.getFloatTimeDomainData(samples);
+                let sum = 0;
+                for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+                const rms = Math.sqrt(sum / samples.length);
+                db = rms > 0 ? Math.max(-60, Math.min(0, 20 * Math.log10(rms))) : -60;
+            }
+            track.lineInLevel = db;
+            const percent = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+            if (fill) fill.style.width = `${percent}%`;
+            meter.classList.toggle('signal', db > -48);
+            meter.classList.toggle('hot', db > -6);
+            meter.setAttribute('aria-valuenow', db.toFixed(1));
+            if (readout) readout.textContent = track.lineInInputStream?.active ? `${Math.round(db)} dB` : 'IDLE';
+            if (track.lineInActiveSource && waveform) drawLineInWaveform(waveform, track);
+            requestAnimationFrame(() => updateLineInMeter(meter, track, waveform));
         }
 
         function hydrateTrack(trackData = {}) {
@@ -1453,8 +1747,41 @@
             track.samplerReverse = defaults.samplerReverse;
             track.samplerGain = defaults.samplerGain;
             track.samplerPan = defaults.samplerPan;
+            track.lineInClipDataUrl = defaults.lineInClipDataUrl;
+            track.lineInClipName = defaults.lineInClipName;
+            track.lineInBuffer = null;
+            track.lineInDeviceId = 'default';
+            track.lineInInputStream = null;
+            track.lineInSourceNode = null;
+            track.lineInAnalyserNode = audioCtx.createAnalyser();
+            track.lineInAnalyserNode.fftSize = 1024;
+            track.lineInAnalyserNode.smoothingTimeConstant = 0.78;
+            track.lineInMeterSamples = new Float32Array(track.lineInAnalyserNode.fftSize);
+            track.lineInLevel = -60;
+            track.lineInMonitorNode = audioCtx.createGain();
+            track.lineInMonitorNode.gain.value = 0;
+            track.lineInAnalyserNode.connect(track.lineInMonitorNode);
+            track.lineInMonitorNode.connect(track.filterNode);
+            track.lineInMonitorEnabled = false;
+            track.lineInRecorder = null;
+            track.lineInChunks = [];
+            track.lineInRecording = false;
+            track.lineInActiveSource = null;
+            track.lineInStatus = defaults.typeId === 'lineIn' ? 'Choose an input, record, or import audio' : '';
             track.arp = normalizeArp(defaults.arp);
             applyTrackFilter(track);
+
+            const baseCleanup = track.cleanup;
+            track.cleanup = () => {
+                stopLineInStream(track);
+                if (track.lineInActiveSource) {
+                    try { track.lineInActiveSource.stop(); } catch (e) { }
+                    track.lineInActiveSource = null;
+                }
+                try { track.lineInAnalyserNode.disconnect(); } catch (e) { }
+                try { track.lineInMonitorNode.disconnect(); } catch (e) { }
+                baseCleanup();
+            };
             return track;
         }
 
@@ -1879,9 +2206,12 @@
         }
 
         function updateSoloMuteUI() {
+            const anySolo = state.tracks.some(track => track.solo);
             state.tracks.forEach(t => {
                 if (t.soloBtn) t.soloBtn.classList.toggle('active', t.solo);
                 if (t.muteBtn) t.muteBtn.classList.toggle('active', t.muted);
+                const audible = !t.muted && (!anySolo || t.solo);
+                t.gainNode?.gain.setTargetAtTime(audible ? t.volume : 0, audioCtx.currentTime, 0.01);
 
                 // Also update mixer strips
                 const strip = mixerStripCache.get(t.id);
@@ -3073,6 +3403,142 @@
             return addBtn;
         }
 
+        function createLineInPanel(track) {
+            const panel = document.createElement('div');
+            panel.className = 'line-in-panel interactive-element';
+            panel.onclick = event => event.stopPropagation();
+
+            const deviceSelect = document.createElement('select');
+            deviceSelect.className = 'line-in-device';
+            deviceSelect.setAttribute('aria-label', 'Windows audio input device');
+            const initialDevice = document.createElement('option');
+            initialDevice.value = track.lineInDeviceId || 'default';
+            initialDevice.textContent = 'Windows default input';
+            deviceSelect.appendChild(initialDevice);
+            deviceSelect.onchange = async event => {
+                track.lineInDeviceId = event.target.value;
+                if (track.lineInInputStream && !track.lineInRecording) {
+                    try {
+                        await openLineInStream(track);
+                        setLineInStatus(track, `Input ready · ${event.target.selectedOptions[0].textContent}`);
+                    } catch (error) {
+                        setLineInStatus(track, getLineInErrorMessage(error));
+                    }
+                }
+            };
+            refreshLineInDevices(track, deviceSelect);
+
+            const actions = document.createElement('div');
+            actions.className = 'line-in-actions';
+            const recordBtn = document.createElement('button');
+            recordBtn.textContent = track.lineInRecording ? '■ STOP' : '● REC';
+            recordBtn.className = track.lineInRecording ? 'line-in-recording' : '';
+            setTooltip(recordBtn, 'Record Input', 'Capture the selected microphone, audio interface, or instrument input as a waveform clip.');
+            recordBtn.onclick = () => toggleLineInRecording(track);
+
+            const monitorBtn = document.createElement('button');
+            monitorBtn.textContent = 'MON';
+            monitorBtn.className = track.lineInMonitorEnabled ? 'active' : '';
+            setTooltip(monitorBtn, 'Input Monitoring', 'Hear the live input through this track and its effects. Use headphones to prevent feedback.');
+            monitorBtn.onclick = async () => {
+                track.lineInMonitorEnabled = !track.lineInMonitorEnabled;
+                try {
+                    if (track.lineInMonitorEnabled && !track.lineInInputStream) await openLineInStream(track);
+                    track.lineInMonitorNode.gain.setTargetAtTime(track.lineInMonitorEnabled ? 1 : 0, audioCtx.currentTime, 0.01);
+                    if (!track.lineInMonitorEnabled && !track.lineInRecording) stopLineInStream(track);
+                    track.lineInStatus = track.lineInMonitorEnabled
+                        ? 'Monitoring live input · headphones recommended'
+                        : (track.lineInClipName || 'Monitoring off');
+                } catch (error) {
+                    track.lineInMonitorEnabled = false;
+                    track.lineInStatus = getLineInErrorMessage(error);
+                }
+                trackElementCache.delete(track.id);
+                renderTracks();
+            };
+
+            const previewBtn = document.createElement('button');
+            previewBtn.textContent = '▶ PLAY';
+            previewBtn.disabled = !track.lineInBuffer;
+            setTooltip(previewBtn, 'Preview Clip', 'Play the current LINE IN recording or imported clip through this track and its effects.');
+            previewBtn.onclick = () => {
+                if (!track.lineInBuffer) return;
+                noteOn(track, 0, audioCtx.currentTime);
+            };
+
+            const importInput = document.createElement('input');
+            importInput.type = 'file';
+            importInput.accept = 'audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac,.webm';
+            importInput.hidden = true;
+            importInput.onchange = event => importLineInFile(track, event.target.files[0]);
+            const importBtn = document.createElement('button');
+            importBtn.textContent = 'IMPORT';
+            setTooltip(importBtn, 'Import Audio', 'Load an audio recording from this computer into the LINE IN clip.');
+            importBtn.onclick = () => importInput.click();
+
+            const clearBtn = document.createElement('button');
+            clearBtn.textContent = '✕';
+            clearBtn.disabled = !track.lineInBuffer && !track.lineInClipDataUrl;
+            setTooltip(clearBtn, 'Clear Clip', 'Remove the current LINE IN recording or imported audio clip.');
+            clearBtn.onclick = () => clearLineInClip(track);
+            actions.append(recordBtn, monitorBtn, previewBtn, importBtn, importInput, clearBtn);
+
+            const toolbar = document.createElement('div');
+            toolbar.className = 'line-in-toolbar';
+            toolbar.append(deviceSelect, actions);
+
+            const editor = document.createElement('div');
+            editor.className = 'line-in-editor';
+            const editorHeader = document.createElement('div');
+            editorHeader.className = 'line-in-editor-header';
+            const editorTitle = document.createElement('span');
+            editorTitle.className = 'line-in-editor-title';
+            editorTitle.textContent = 'LINE INPUT / WAVEFORM';
+            const clipMeta = document.createElement('span');
+            clipMeta.className = 'line-in-editor-meta';
+            clipMeta.textContent = track.lineInBuffer
+                ? `${track.lineInBuffer.duration.toFixed(2)} SEC · ${track.lineInBuffer.numberOfChannels === 1 ? 'MONO' : 'STEREO'}`
+                : 'NO CLIP LOADED';
+
+            const waveWrap = document.createElement('div');
+            waveWrap.className = 'line-in-wave-wrap';
+            const waveform = document.createElement('canvas');
+            waveform.className = 'line-in-waveform';
+            waveform.setAttribute('aria-label', 'LINE IN clip waveform');
+            const status = document.createElement('div');
+            status.className = 'line-in-status';
+            status.id = `line_in_status_${track.id}`;
+            status.textContent = track.lineInStatus || 'Choose an input, record, or import audio';
+            const meter = document.createElement('div');
+            meter.className = 'line-in-level';
+            meter.setAttribute('role', 'meter');
+            meter.setAttribute('aria-label', 'Live input level');
+            meter.setAttribute('aria-valuemin', '-60');
+            meter.setAttribute('aria-valuemax', '0');
+            meter.setAttribute('aria-valuenow', String(track.lineInLevel ?? -60));
+            const meterLabel = document.createElement('span');
+            meterLabel.className = 'line-in-level-label';
+            meterLabel.textContent = 'INPUT';
+            const meterTrack = document.createElement('span');
+            meterTrack.className = 'line-in-level-track';
+            const meterFill = document.createElement('span');
+            meterFill.className = 'line-in-level-fill';
+            meterTrack.appendChild(meterFill);
+            const meterReadout = document.createElement('span');
+            meterReadout.className = 'line-in-level-readout';
+            meterReadout.textContent = track.lineInInputStream?.active ? `${Math.round(track.lineInLevel)} dB` : 'IDLE';
+            meter.append(meterLabel, meterTrack, meterReadout);
+            editorHeader.append(editorTitle, clipMeta, meter);
+            waveWrap.append(waveform, status);
+            editor.append(editorHeader, waveWrap);
+            panel.append(toolbar, editor);
+            requestAnimationFrame(() => {
+                drawLineInWaveform(waveform, track);
+                updateLineInMeter(meter, track, waveform);
+            });
+            return panel;
+        }
+
         function createTrackEl(track, index) {
             const template = instrumentTypes[track.typeId];
             const trackEl = document.createElement('div');
@@ -3201,7 +3667,7 @@
 
             volGroup.appendChild(volLabel);
             volGroup.appendChild(volInput);
-            volInput.oninput = (e) => { track.volume = parseFloat(e.target.value); track.gainNode.gain.value = track.volume; };
+            volInput.oninput = (e) => { track.volume = parseFloat(e.target.value); updateSoloMuteUI(); };
             const panGroup = document.createElement('div');
             panGroup.className = 'slider-group';
             panGroup.setAttribute('data-tooltip-title', 'Pan');
@@ -3557,7 +4023,7 @@
             randGroup.append(randTop, randGrid);
 
             let glideGroup = null;
-            if (template.type !== 'drum') {
+            if (template.type === 'synth') {
                 glideGroup = document.createElement('div');
                 glideGroup.className = 'melodic-glide-group';
                 glideGroup.style.cssText = 'display:flex; flex-direction:column; gap:3px; padding:4px 6px; background:rgba(255,255,255,0.03); border:1px solid var(--glass-border); border-radius:5px; min-width:118px;';
@@ -3750,9 +4216,14 @@
                     };
                     const topRightGroup = document.createElement('div');
                     topRightGroup.style.cssText = 'margin-left:auto; display:flex; align-items:center; gap:8px; padding-right:32px;';
-                    prepareHeaderMidiHub(midiHub, track);
-                    topRightGroup.append(midiHub, meterContainer, loopGroup, subdivSelect);
-                    row1.append(minBtn, patchIn, select, octGroup, soloMuteCont, volPanCont, scBtn || document.createElement('div'), topRightGroup);
+                    if (template.type !== 'audio') {
+                        prepareHeaderMidiHub(midiHub, track);
+                        topRightGroup.append(midiHub);
+                    }
+                    topRightGroup.append(meterContainer, loopGroup, subdivSelect);
+                    row1.append(minBtn, patchIn, select);
+                    if (template.type !== 'audio') row1.append(octGroup);
+                    row1.append(soloMuteCont, volPanCont, scBtn || document.createElement('div'), topRightGroup);
                     if (isMelodicPanel && adsrGroup) {
                         const adsrCanvas = adsrGroup.querySelector('.adsr-display');
                         if (adsrCanvas) {
@@ -3761,7 +4232,11 @@
                             adsrCanvas.height = 76 * dpr;
                         }
                     }
-                    if (isMelodicPanel) {
+                    if (template.type === 'audio') {
+                        row1.classList.add('line-in-control-row');
+                        row2.classList.add('line-in-module-row');
+                        row2.append(xyGroup, createMelodicDivider(), createLineInPanel(track));
+                    } else if (isMelodicPanel) {
                         const perfGroup = document.createElement('div');
                         perfGroup.className = 'melodic-perf-group';
                         perfGroup.append(glideGroup || document.createElement('div'), track.arpGroup || document.createElement('div'));
@@ -3791,13 +4266,16 @@
                 header.style.padding = '7px 8px 10px';
                 header.style.border = '1px solid var(--glass-border)';
                 header.style.borderRadius = '8px';
-                header.append(minBtn, patchIn, document.createTextNode(instrumentTypes[track.typeId].name), octBadge, createMinimizedModStrip(track), meterContainer, soloBtn, muteBtn);
-                appendHeaderMidiHub(header, track, midiHub, true);
+                header.append(minBtn, patchIn, document.createTextNode(instrumentTypes[track.typeId].name));
+                if (template.type !== 'audio') header.append(octBadge, createMinimizedModStrip(track));
+                header.append(meterContainer, soloBtn, muteBtn);
+                if (template.type !== 'audio') appendHeaderMidiHub(header, track, midiHub, true);
             }
 
             trackEl.appendChild(header); trackEl.appendChild(audioOut);
 
-            if (!track.minimized) {
+            if (!track.minimized && template.type === 'audio') track.gridCells = [];
+            if (!track.minimized && template.type !== 'audio') {
                 const gridCont = document.createElement('div'); gridCont.className = 'grid-container';
                 track.gridCells = [];
                 template.rows.forEach((rowName, rIdx) => {
@@ -3903,7 +4381,7 @@
                 const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
                 window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
             };
-            trackEl.appendChild(resizer);
+            if (template.type !== 'audio') trackEl.appendChild(resizer);
 
             setTimeout(() => {
                 [xyCanvas, track.adsrCanvas].forEach(c => {
@@ -5844,6 +6322,33 @@
             const voice = { id: voiceId, track, rowIdx, gain: localGain, nodes: [], lfo: null, lfoGain: null, doubledFromId: doubledFromId, isArp: !!stepData?.arp, startTime: time, oneShot: !isHeldVoice(track, rowIdx, template) };
             state.activeNotes.set(voiceId, voice);
 
+            if (template.type === 'audio') {
+                if (!track.lineInBuffer) {
+                    state.activeNotes.delete(voiceId);
+                    try { localGain.disconnect(); } catch (e) { }
+                    return null;
+                }
+                if (track.lineInActiveSource) {
+                    try { track.lineInActiveSource.stop(Math.max(audioCtx.currentTime, time)); } catch (e) { }
+                }
+                const source = audioCtx.createBufferSource();
+                source.buffer = track.lineInBuffer;
+                source.connect(localGain);
+                localGain.gain.setValueAtTime(1, Math.max(audioCtx.currentTime, time));
+                source.onended = () => {
+                    if (track.lineInActiveSource === source) track.lineInActiveSource = null;
+                    state.activeNotes.delete(voiceId);
+                    try { source.disconnect(); localGain.disconnect(); } catch (e) { }
+                };
+                track.lineInActiveSource = source;
+                track.lineInPlaybackStartedAt = Math.max(audioCtx.currentTime, time);
+                track.lineInPlaybackDuration = track.lineInBuffer.duration;
+                voice.oneShot = true;
+                voice.nodes.push(source);
+                source.start(Math.max(audioCtx.currentTime, time));
+                return voice;
+            }
+
             // Handle MIDI Doubling
             if (!doubledFromId && track.midiDoublingTargetId) {
                 const targetTrack = state.tracks.find(t => t.id === track.midiDoublingTargetId);
@@ -7171,7 +7676,7 @@
             const preserveRowPositions = previousScale === state.globalScale && oldRows.length === newRows.length;
 
             state.tracks.forEach(t => {
-                if (instrumentTypes[t.typeId].type !== 'drum') {
+                if (instrumentTypes[t.typeId].type === 'synth') {
                     const oldGrid = t.grid;
                     const newRowsLength = newRows.length;
                     const newGrid = Array(newRowsLength).fill().map(() => Array(256).fill(false));

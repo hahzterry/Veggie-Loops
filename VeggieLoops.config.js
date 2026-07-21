@@ -134,7 +134,8 @@ const instrumentTypes = {
 'clavinet': { name: 'Funk Clav', rows: [], type: 'synth', adsr: { a: 0.003, d: 0.24, s: 0.0, r: 0.1 }, xy: { x: 0.62, y: 0.14 } },
 'theremin': { name: 'Porta Lead', rows: [], type: 'synth', adsr: { a: 0.16, d: 0.12, s: 0.86, r: 0.42 }, xy: { x: 0.42, y: 0.04 }, baseOctaveOffset: 1, voiceLfoDefault: true },
 'whiteNoise': { name: 'Noise Wash', rows: [], type: 'synth', adsr: { a: 0.12, d: 0.65, s: 0.12, r: 0.7 }, xy: { x: 0.72, y: 0.08 } },
-'bassGuitar': { name: 'Picked Bass', rows: [], type: 'synth', adsr: { a: 0.004, d: 0.38, s: 0.16, r: 0.22 }, baseOctaveOffset: -2, xy: { x: 0.18, y: 0.08 } }
+'bassGuitar': { name: 'Picked Bass', rows: [], type: 'synth', adsr: { a: 0.004, d: 0.38, s: 0.16, r: 0.22 }, baseOctaveOffset: -2, xy: { x: 0.18, y: 0.08 } },
+'lineIn': { name: 'LINE IN', rows: ['CLIP'], type: 'audio', xy: { x: 0.8, y: 0.05 } }
 };
 
 const fxDefaults = {

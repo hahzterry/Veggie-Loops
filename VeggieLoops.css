@@ -1045,6 +1045,182 @@
             margin-left: auto;
         }
 
+        /* --- LINE IN audio capture --- */
+        .line-in-control-row {
+            border-bottom-color: rgba(0, 242, 255, 0.16);
+        }
+
+        .line-in-module-row {
+            min-height: 154px;
+            gap: 12px;
+            align-items: stretch;
+        }
+
+        .line-in-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            flex: 1;
+            min-width: 0;
+            padding: 8px 10px;
+            background: linear-gradient(135deg, rgba(0, 242, 255, 0.055), rgba(180, 0, 255, 0.025));
+            border: 1px solid rgba(0, 242, 255, 0.2);
+            border-radius: 7px;
+            box-shadow: inset 0 0 18px rgba(0, 0, 0, 0.28);
+        }
+
+        .line-in-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .line-in-device {
+            width: min(280px, 34%);
+            min-width: 0;
+            height: 24px;
+            color: var(--accent-cyan);
+            background: #0c0c11;
+            border: 1px solid var(--glass-border);
+            border-radius: 4px;
+            font-size: 0.58rem;
+        }
+
+        .line-in-actions {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-wrap: wrap;
+        }
+
+        .line-in-actions button {
+            height: 24px;
+            padding: 2px 7px;
+            white-space: nowrap;
+            font-size: 0.55rem;
+        }
+
+        .line-in-recording {
+            color: #fff !important;
+            background: #d31345 !important;
+            border-color: #ff4775 !important;
+            box-shadow: 0 0 12px rgba(255, 71, 117, 0.45);
+        }
+
+        .line-in-wave-wrap {
+            min-width: 0;
+            height: 92px;
+            position: relative;
+            overflow: hidden;
+            background: #050507;
+        }
+
+        .line-in-editor {
+            position: relative;
+            min-width: 0;
+            overflow: hidden;
+            background: linear-gradient(180deg, #08080c 0%, #050507 100%);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 5px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 18px rgba(0, 0, 0, 0.25);
+        }
+
+        .line-in-editor-header {
+            min-height: 18px;
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 3px 8px;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
+            border-bottom: 1px solid rgba(0, 242, 255, 0.12);
+        }
+
+        .line-in-editor-title {
+            color: #989fac;
+            font: 800 0.5rem var(--font-mono);
+            letter-spacing: 0.1em;
+        }
+
+        .line-in-editor-meta {
+            color: rgba(255, 234, 0, 0.72);
+            font: 0.45rem var(--font-mono);
+            letter-spacing: 0.05em;
+        }
+
+        .line-in-waveform {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .line-in-level {
+            position: static;
+            display: grid;
+            grid-template-columns: auto 70px 34px;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 5px;
+            color: var(--text-dim);
+            background: rgba(3, 3, 6, 0.88);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 3px;
+            font: 0.44rem var(--font-mono);
+            pointer-events: none;
+            margin-left: auto;
+        }
+
+        .line-in-level-label {
+            color: var(--text-dim);
+            letter-spacing: 0.08em;
+        }
+
+        .line-in-level-track {
+            position: relative;
+            height: 5px;
+            overflow: hidden;
+            background: #17171d;
+            border-radius: 2px;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+        }
+
+        .line-in-level-fill {
+            display: block;
+            width: 0;
+            height: 100%;
+            background: linear-gradient(90deg, #00b58a 0%, #00f2ff 72%, #ffd400 90%, #ff315e 100%);
+            box-shadow: 0 0 6px rgba(0, 242, 255, 0.6);
+            transition: width 55ms linear;
+        }
+
+        .line-in-level.signal .line-in-level-label {
+            color: #00f2ff;
+        }
+
+        .line-in-level.hot .line-in-level-label,
+        .line-in-level.hot .line-in-level-readout {
+            color: #ff5c77;
+        }
+
+        .line-in-level-readout {
+            min-width: 34px;
+            color: #aeb4bf;
+            text-align: right;
+        }
+
+        .line-in-status {
+            position: absolute;
+            left: 7px;
+            bottom: 3px;
+            max-width: calc(100% - 14px);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--text-dim);
+            font: 0.48rem var(--font-mono);
+            pointer-events: none;
+            text-shadow: 0 1px 2px #000;
+        }
+
         .mpc-key {
             position: relative;
             cursor: pointer;
@@ -2046,5 +2222,13 @@
                 justify-content: flex-end;
                 min-width: 0;
                 height: auto;
+            }
+
+            .line-in-panel {
+                padding-inline: 8px;
+            }
+
+            .line-in-device {
+                width: min(230px, 31%);
             }
         }
