@@ -1287,11 +1287,14 @@
         async function openLineInStream(track) {
             if (!navigator.mediaDevices?.getUserMedia) throw new Error('Live input is not supported in this browser');
             stopLineInStream(track);
+            // Resume while the ARM/MON/REC click is still an active user gesture.
+            // Waiting until after the permission prompt can leave Web Audio suspended,
+            // producing an apparently connected stream whose analyser only reads silence.
+            if (audioCtx.state !== 'running') await audioCtx.resume();
             const audio = track.lineInDeviceId && track.lineInDeviceId !== 'default'
                 ? { deviceId: { exact: track.lineInDeviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
                 : { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
             const stream = await navigator.mediaDevices.getUserMedia({ audio });
-            if (audioCtx.state === 'suspended') await audioCtx.resume();
             track.lineInInputStream = stream;
             track.lineInSourceNode = audioCtx.createMediaStreamSource(stream);
             track.lineInSourceNode.connect(track.lineInAnalyserNode);
