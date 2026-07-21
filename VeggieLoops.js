@@ -1405,7 +1405,7 @@
                     } catch (error) {
                         setLineInStatus(track, `Recording could not be decoded: ${error.message}`);
                     } finally {
-                        if (!track.lineInMonitorEnabled) stopLineInStream(track);
+                        if (!track.lineInMonitorEnabled && !track.lineInInputArmed) stopLineInStream(track);
                         trackElementCache.delete(track.id);
                         renderTracks();
                     }
@@ -1763,6 +1763,7 @@
             track.lineInAnalyserNode.connect(track.lineInMonitorNode);
             track.lineInMonitorNode.connect(track.filterNode);
             track.lineInMonitorEnabled = false;
+            track.lineInInputArmed = false;
             track.lineInRecorder = null;
             track.lineInChunks = [];
             track.lineInRecording = false;
@@ -3417,19 +3418,48 @@
             deviceSelect.appendChild(initialDevice);
             deviceSelect.onchange = async event => {
                 track.lineInDeviceId = event.target.value;
-                if (track.lineInInputStream && !track.lineInRecording) {
+                if (!track.lineInRecording) {
+                    track.lineInInputArmed = true;
                     try {
                         await openLineInStream(track);
-                        setLineInStatus(track, `Input ready · ${event.target.selectedOptions[0].textContent}`);
+                        setLineInStatus(track, `Input armed · ${event.target.selectedOptions[0].textContent}`);
                     } catch (error) {
+                        track.lineInInputArmed = false;
                         setLineInStatus(track, getLineInErrorMessage(error));
                     }
+                    trackElementCache.delete(track.id);
+                    renderTracks();
                 }
             };
             refreshLineInDevices(track, deviceSelect);
 
             const actions = document.createElement('div');
             actions.className = 'line-in-actions';
+            const armBtn = document.createElement('button');
+            armBtn.textContent = track.lineInInputStream?.active ? 'INPUT ON' : 'ARM INPUT';
+            armBtn.className = track.lineInInputStream?.active ? 'active line-in-armed' : '';
+            setTooltip(armBtn, 'Arm Input Meter', 'Open the selected microphone or audio interface so the input meter responds without sending audio to the speakers.');
+            armBtn.onclick = async () => {
+                if (track.lineInInputStream?.active) {
+                    if (track.lineInRecording) return;
+                    track.lineInInputArmed = false;
+                    track.lineInMonitorEnabled = false;
+                    track.lineInMonitorNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.01);
+                    stopLineInStream(track);
+                    track.lineInStatus = 'Input off · click ARM INPUT to check your level';
+                } else {
+                    track.lineInInputArmed = true;
+                    try {
+                        await openLineInStream(track);
+                        track.lineInStatus = 'Input armed · sing or play to check the level';
+                    } catch (error) {
+                        track.lineInInputArmed = false;
+                        track.lineInStatus = getLineInErrorMessage(error);
+                    }
+                }
+                trackElementCache.delete(track.id);
+                renderTracks();
+            };
             const recordBtn = document.createElement('button');
             recordBtn.textContent = track.lineInRecording ? '■ STOP' : '● REC';
             recordBtn.className = track.lineInRecording ? 'line-in-recording' : '';
@@ -3445,10 +3475,12 @@
                 try {
                     if (track.lineInMonitorEnabled && !track.lineInInputStream) await openLineInStream(track);
                     track.lineInMonitorNode.gain.setTargetAtTime(track.lineInMonitorEnabled ? 1 : 0, audioCtx.currentTime, 0.01);
-                    if (!track.lineInMonitorEnabled && !track.lineInRecording) stopLineInStream(track);
+                    if (!track.lineInMonitorEnabled && !track.lineInRecording && !track.lineInInputArmed) stopLineInStream(track);
                     track.lineInStatus = track.lineInMonitorEnabled
                         ? 'Monitoring live input · headphones recommended'
-                        : (track.lineInClipName || 'Monitoring off');
+                        : (track.lineInInputArmed
+                            ? 'Input armed · sing or play to check the level'
+                            : (track.lineInClipName || 'Monitoring off'));
                 } catch (error) {
                     track.lineInMonitorEnabled = false;
                     track.lineInStatus = getLineInErrorMessage(error);
@@ -3481,7 +3513,7 @@
             clearBtn.disabled = !track.lineInBuffer && !track.lineInClipDataUrl;
             setTooltip(clearBtn, 'Clear Clip', 'Remove the current LINE IN recording or imported audio clip.');
             clearBtn.onclick = () => clearLineInClip(track);
-            actions.append(recordBtn, monitorBtn, previewBtn, importBtn, importInput, clearBtn);
+            actions.append(armBtn, recordBtn, monitorBtn, previewBtn, importBtn, importInput, clearBtn);
 
             const toolbar = document.createElement('div');
             toolbar.className = 'line-in-toolbar';
@@ -3614,7 +3646,7 @@
                 label.className = 'label'; label.style.width = '80px'; label.textContent = instrumentTypes[track.typeId].name;
                 header.appendChild(label);
             } else {
-                select.onchange = (e) => {
+                select.onchange = async (e) => {
                     pushUndo();
                     const oldTrack = track;
                     const oldGrid = track.grid;
@@ -3642,6 +3674,18 @@
                     }
                     refreshLookupMap();
                     renderTracks();
+                    if (newTrack.typeId === 'lineIn') {
+                        newTrack.lineInInputArmed = true;
+                        try {
+                            await openLineInStream(newTrack);
+                            newTrack.lineInStatus = 'Input armed · sing or play to check the level';
+                        } catch (error) {
+                            newTrack.lineInInputArmed = false;
+                            newTrack.lineInStatus = getLineInErrorMessage(error);
+                        }
+                        trackElementCache.delete(newTrack.id);
+                        renderTracks();
+                    }
                 };
                 select.onclick = (e) => e.stopPropagation();
                 header.appendChild(select);

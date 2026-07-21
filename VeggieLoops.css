@@ -1107,6 +1107,13 @@
             box-shadow: 0 0 12px rgba(255, 71, 117, 0.45);
         }
 
+        .line-in-armed {
+            color: #00130f !important;
+            background: #36e3ae !important;
+            border-color: #7affd7 !important;
+            box-shadow: 0 0 10px rgba(54, 227, 174, 0.38);
+        }
+
         .line-in-wave-wrap {
             min-width: 0;
             height: 92px;
