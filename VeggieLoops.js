@@ -1143,13 +1143,22 @@
                 mixerGain: 0.75,
                 lineInClipDataUrl: null,
                 lineInClipName: '',
+                lineInClipId: null,
                 arp: createDefaultArp()
             };
         }
 
         function serializeTrack(track, options = {}) {
-            const { includeId = true, includeMinimized = true } = options;
+            const { includeId = true, includeMinimized = true, forUndo = false, forScene = false } = options;
             const arp = track.arp ? normalizeArp(track.arp) : null;
+            // Undo and scene snapshots reference the clip instead of embedding its
+            // bytes; the full data URL is only embedded when saving a session file.
+            const isLineIn = track.typeId === 'lineIn';
+            const snapshotByRef = forUndo || forScene;
+            const clipId = isLineIn && track.lineInClipId ? track.lineInClipId : null;
+            if (snapshotByRef && clipId && track.lineInClipDataUrl) {
+                registerLineInClip(clipId, track.lineInClipDataUrl);
+            }
             const data = {
                 schemaVersion: TRACK_SCHEMA_VERSION,
                 typeId: resolveTrackTypeId(track.typeId),
@@ -1177,8 +1186,9 @@
                 samplerReverse: !!track.samplerReverse,
                 samplerGain: numberOrDefault(track.samplerGain, 1.0),
                 samplerPan: numberOrDefault(track.samplerPan, 0.0),
-                lineInClipDataUrl: track.typeId === 'lineIn' ? (track.lineInClipDataUrl || null) : null,
-                lineInClipName: track.typeId === 'lineIn' ? (track.lineInClipName || '') : '',
+                lineInClipDataUrl: snapshotByRef ? null : (isLineIn ? (track.lineInClipDataUrl || null) : null),
+                lineInClipName: isLineIn ? (track.lineInClipName || '') : '',
+                lineInClipRef: snapshotByRef ? clipId : null,
                 glide: !!track.glide,
                 glideTime: numberOrDefault(track.glideTime, 0.1),
                 glideMode: track.glideMode || 'portamento',
@@ -1236,6 +1246,21 @@
             track.samplerPan = numberOrDefault(trackData.samplerPan, defaults.samplerPan);
             track.lineInClipDataUrl = typeof trackData.lineInClipDataUrl === 'string' ? trackData.lineInClipDataUrl : null;
             track.lineInClipName = typeof trackData.lineInClipName === 'string' ? trackData.lineInClipName : '';
+            track.lineInClipId = null;
+            if (track.lineInClipDataUrl) {
+                // Fresh bytes (e.g. session file): register so later undo/scene
+                // snapshots can reference them instead of duplicating them.
+                track.lineInClipId = makeLineInClipId();
+                registerLineInClip(track.lineInClipId, track.lineInClipDataUrl);
+            } else if (typeof trackData.lineInClipRef === 'string') {
+                const stored = lineInClipStore.get(trackData.lineInClipRef);
+                if (stored) {
+                    track.lineInClipId = trackData.lineInClipRef;
+                    track.lineInClipDataUrl = stored;
+                } else {
+                    track.lineInStatus = 'Clip expired from history — re-record or re-import';
+                }
+            }
             track.glide = boolOrDefault(trackData.glide, defaults.glide);
             track.glideTime = numberOrDefault(trackData.glideTime, defaults.glideTime);
             track.glideMode = trackData.glideMode || defaults.glideMode;
@@ -1326,13 +1351,51 @@
             }
         }
 
-        function blobToDataUrl(blob) {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = () => reject(reader.error || new Error('Could not read the audio clip'));
-                reader.readAsDataURL(blob);
+        // --- LINE IN clip store: undo/scene snapshots reference clips, not bytes ---
+        // A recorded clip is a large base64 data URL. Embedding it in every undo
+        // snapshot (30 deep) or scene snapshot duplicates megabytes per entry.
+        // Snapshots therefore carry a lightweight clip id; the bytes live here.
+        const lineInClipStore = new Map();
+        const LINE_IN_CLIP_STORE_MAX = 120;
+        function makeLineInClipId() {
+            return 'clip_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        }
+        function registerLineInClip(clipId, dataUrl) {
+            if (!clipId || typeof dataUrl !== 'string' || !dataUrl) return;
+            // Re-insert to refresh FIFO recency.
+            if (lineInClipStore.has(clipId)) lineInClipStore.delete(clipId);
+            lineInClipStore.set(clipId, dataUrl);
+            while (lineInClipStore.size > LINE_IN_CLIP_STORE_MAX) {
+                lineInClipStore.delete(lineInClipStore.keys().next().value);
+            }
+        }
+        // Session files must embed clip bytes (this store doesn't survive reload);
+        // undo snapshots keep references. Resolve references when saving to file.
+        function resolveLineInClipRefs(scenes, options = {}) {
+            if (options.forUndo || options.forScene || !Array.isArray(scenes)) return scenes;
+            scenes.forEach(scene => {
+                if (!scene || !Array.isArray(scene.tracks)) return;
+                scene.tracks.forEach(trackData => {
+                    if (trackData && !trackData.lineInClipDataUrl && typeof trackData.lineInClipRef === 'string') {
+                        const stored = lineInClipStore.get(trackData.lineInClipRef);
+                        if (stored) {
+                            trackData.lineInClipDataUrl = stored;
+                            trackData.lineInClipRef = null;
+                        }
+                    }
+                });
             });
+            return scenes;
+        }
+
+        function arrayBufferToDataUrl(buffer, mimeType) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+            }
+            return `data:${mimeType};base64,${btoa(binary)}`;
         }
 
         async function decodeLineInDataUrl(dataUrl) {
@@ -1358,12 +1421,16 @@
         async function loadLineInBlob(track, blob, name) {
             if (!blob?.size) throw new Error('The audio clip is empty');
             if (audioCtx.state === 'suspended') await audioCtx.resume();
-            const [dataUrl, decoded] = await Promise.all([
-                blobToDataUrl(blob),
-                audioCtx.decodeAudioData(await blob.arrayBuffer())
-            ]);
+            // Read the blob once: build the persisted data URL from the same
+            // bytes that get decoded, instead of reading the blob twice.
+            // decodeAudioData detaches the buffer, so the data URL is built first.
+            const arrayBuffer = await blob.arrayBuffer();
+            const dataUrl = arrayBufferToDataUrl(arrayBuffer, blob.type || 'audio/webm');
+            const decoded = await audioCtx.decodeAudioData(arrayBuffer);
             track.lineInClipDataUrl = dataUrl;
             track.lineInClipName = name || 'Audio clip';
+            track.lineInClipId = makeLineInClipId();
+            registerLineInClip(track.lineInClipId, dataUrl);
             track.lineInBuffer = decoded;
             track.grid[0][0] = { on: true, length: 1 };
             track.lineInStatus = `${track.lineInClipName} · ${decoded.duration.toFixed(1)}s`;
@@ -1391,7 +1458,8 @@
                 if (typeof MediaRecorder === 'undefined') throw new Error('Audio recording is not supported in this browser');
                 pushUndo();
                 const stream = track.lineInInputStream || await openLineInStream(track);
-                const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+                // Safari's MediaRecorder only produces mp4/AAC; prefer webm/opus where available.
+                const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
                 const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type));
                 track.lineInChunks = [];
                 track.lineInRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
@@ -1431,6 +1499,7 @@
             }
             track.lineInClipDataUrl = null;
             track.lineInClipName = '';
+            track.lineInClipId = null;
             track.lineInBuffer = null;
             track.grid[0].fill(false);
             track.lineInStatus = 'Choose an input, record, or import audio';
@@ -1752,6 +1821,7 @@
             track.samplerPan = defaults.samplerPan;
             track.lineInClipDataUrl = defaults.lineInClipDataUrl;
             track.lineInClipName = defaults.lineInClipName;
+            track.lineInClipId = null;
             track.lineInBuffer = null;
             track.lineInDeviceId = 'default';
             track.lineInInputStream = null;
@@ -4950,7 +5020,7 @@
         // --- Scene Management ---
         function saveScene(idx) {
             state.scenes[idx] = {
-                tracks: state.tracks.map(t => serializeTrack(t, { includeId: false, includeMinimized: false })),
+                tracks: state.tracks.map(t => serializeTrack(t, { includeId: false, includeMinimized: false, forScene: true })),
                 fx: state.fxUnits.map(u => ({
                     type: u.type,
                     params: JSON.parse(JSON.stringify(u.params)),
@@ -7570,7 +7640,7 @@
         let currentBatchIdx = -1;
 
         function getMimeType() {
-            const types = ['audio/mpeg', 'audio/mp3', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+            const types = ['audio/mpeg', 'audio/mp3', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
             for (const t of types) if (MediaRecorder.isTypeSupported(t)) return t;
             return '';
         }
@@ -8406,14 +8476,16 @@
         }
 
         // --- Session Management (File I/O) ---
-        function getSessionData() {
+        // options.forUndo: snapshots reference LINE IN clips instead of embedding
+        // their bytes, so the undo stack doesn't duplicate megabytes per entry.
+        function getSessionData(options = {}) {
             return {
                 version: "1.1",
                 bpm: state.bpm,
                 timeSignature: state.timeSignature,
                 globalKey: state.globalKey,
                 globalScale: state.globalScale,
-                tracks: state.tracks.map(t => serializeTrack(t)),
+                tracks: state.tracks.map(t => serializeTrack(t, options)),
                 activeTrackId: state.activeTrackId,
                 fxUnits: state.fxUnits.map(u => ({
                     id: u.id,
@@ -8423,7 +8495,7 @@
                     audioRoute: u.audioRoute || 'master',
                     outputGain: u.outputGain ?? 0.75
                 })),
-                scenes: JSON.parse(JSON.stringify(state.scenes)),
+                scenes: resolveLineInClipRefs(JSON.parse(JSON.stringify(state.scenes)), options),
                 drawers: state.drawers.map(d => ({
                     id: d.id,
                     connection: d.connection,
@@ -8502,21 +8574,21 @@
         }
 
         function pushUndo() {
-            state.undoStack.push(JSON.stringify(getSessionData()));
+            state.undoStack.push(JSON.stringify(getSessionData({ forUndo: true })));
             if (state.undoStack.length > state.maxUndo) state.undoStack.shift();
             state.redoStack = [];
         }
 
         function undo() {
             if (state.undoStack.length === 0) return;
-            state.redoStack.push(JSON.stringify(getSessionData()));
+            state.redoStack.push(JSON.stringify(getSessionData({ forUndo: true })));
             const data = JSON.parse(state.undoStack.pop());
             applySessionData(data);
         }
 
         function redo() {
             if (state.redoStack.length === 0) return;
-            state.undoStack.push(JSON.stringify(getSessionData()));
+            state.undoStack.push(JSON.stringify(getSessionData({ forUndo: true })));
             const data = JSON.parse(state.redoStack.pop());
             applySessionData(data);
         }
